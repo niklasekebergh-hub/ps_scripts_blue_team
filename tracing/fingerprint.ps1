@@ -101,7 +101,7 @@ function Run-FallbackSampler([int]$DurationSeconds, [double]$IntervalSeconds, [i
 
   function Touch([string]$dir, [int]$lport, [string]$rip, [int]$rport, [int]$pid, [string]$state) {
     if ($Port -gt 0 -and $lport -ne $Port -and $rport -ne $Port) { return }
-    $key = "$dir|L:$lport|R:$rip:$rport"
+    $key = "$dir|L:$lport|R:${rip}:$rport"
     if (-not $agg.ContainsKey($key)) {
       $agg[$key] = [pscustomobject]@{
         Dir=$dir; LocalPort=$lport; RemoteIP=$rip; RemotePort=$rport;
@@ -137,7 +137,7 @@ function Run-FallbackSampler([int]$DurationSeconds, [double]$IntervalSeconds, [i
         $lport = [int]($local.Split(':')[-1])
         $rport = [int]($remote.Split(':')[-1])
         $rip   = ($remote -split ':')[0]
-        $dir   = $listenerPorts.ContainsKey($lport) ? "IN" : "OUT"
+        $dir   = if ($listenerPorts.ContainsKey($lport)) { "IN" } else { "OUT" }
         Touch $dir $lport $rip $rport $pid $state
       }
     }
