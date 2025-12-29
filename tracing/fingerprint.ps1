@@ -1,255 +1,249 @@
+[CmdletBinding()]
 param(
-  [int]$DurationSeconds = 20,
-  [double]$IntervalSeconds = 0.5,
-  [int]$Top = 15,
-  [int]$Port = 0,  # optional focus: only show flows involving this port
-  [ValidateSet("TCP","UDP","ANY")] [string]$Protocol = "TCP",
-  [string]$OutDir = "C:\ccdc"
+  [int]$ServicePort = 0,                 # 0 = no port filter, show global top talkers
+  [ValidateSet("TCP","UDP","ANY")]
+  [string]$Protocol = "TCP",
+  [ValidateSet("recv","send","any")]
+  [string]$Direction = "recv",           # :contentReference[oaicite:3]{index=3}
+  [int]$DurationSeconds = 20,            # capture time (15-30s is typical) :contentReference[oaicite:4]{index=4}
+  [int]$Top = 10,
+  [string]$OutDir = "C:\ccdc",
+  [switch]$NoCapture,                    # analyze existing ETL/CSV instead of capturing
+  [string]$EtlPath,
+  [string]$CsvPath,
+  [switch]$NoisyMode                     # groups by RemoteAddress,RemotePort like playbook's noisy option :contentReference[oaicite:5]{index=5}
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "SilentlyContinue"
+$ErrorActionPreference = "Stop"
 
-function Write-Info($msg){ Write-Host "[*] $msg" }
-function Write-Warn($msg){ Write-Host "[!] $msg" }
-function Write-Err ($msg){ Write-Host "[X] $msg" }
+function Test-Admin {
+  $wp = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  return $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
-function Test-IsAdmin {
+function Ensure-Dir([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path)) {
+    New-Item -ItemType Directory -Path $Path | Out-Null
+  }
+}
+
+function Run-NetshTrace([string]$EtlOut, [int]$Seconds) {
+  Write-Host "[*] Starting capture for $Seconds seconds..."
+  # Prefer tracefile= (common on Windows); fall back to traceroute= (as written in playbook). :contentReference[oaicite:6]{index=6}
+  $started = $false
+
+  $cmd1 = "netsh trace start capture=yes scenario=NetConnection tracefile=`"$EtlOut`""
+  $cmd2 = "netsh trace start capture=yes scenario=NetConnection traceroute=`"$EtlOut`""
+
   try {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $p  = New-Object Security.Principal.WindowsPrincipal($id)
-    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    cmd.exe /c $cmd1 | Out-Null
+    $started = $true
+  } catch {
+    try {
+      cmd.exe /c $cmd2 | Out-Null
+      $started = $true
+    } catch {
+      throw "netsh trace start failed with both tracefile= and traceroute=. Are you Admin? Is netsh trace supported here?"
+    }
+  }
+
+  Start-Sleep -Seconds $Seconds
+  Write-Host "[*] Stopping capture..."
+  cmd.exe /c "netsh trace stop" | Out-Null
+  if (-not (Test-Path -LiteralPath $EtlOut)) {
+    throw "ETL was not created at $EtlOut"
+  }
+}
+
+function Convert-EtlToCsv([string]$EtlIn, [string]$CsvOut) {
+  Write-Host "[*] Converting ETL -> CSV via tracerpt..."
+  # Matches playbook: tracerpt c:\scoring.etl -o c:\scoring.csv -of CSV :contentReference[oaicite:7]{index=7}
+  cmd.exe /c "tracerpt `"$EtlIn`" -o `"$CsvOut`" -of CSV -y" | Out-Null
+  if (-not (Test-Path -LiteralPath $CsvOut)) {
+    throw "CSV was not created at $CsvOut"
+  }
+}
+
+function Get-Prop([object]$Row, [string]$Name) {
+  if ($Row.PSObject.Properties.Name -contains $Name) { return $Row.$Name }
+  return $null
+}
+
+function Is-PrivateIp([string]$Ip) {
+  try {
+    $addr = [System.Net.IPAddress]::Parse($Ip)
+    # IPv4 RFC1918 quick checks
+    if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+      $b = $addr.GetAddressBytes()
+      if ($b[0] -eq 10) { return $true }
+      if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return $true }
+      if ($b[0] -eq 192 -and $b[1] -eq 168) { return $true }
+      return $false
+    }
+    # Treat IPv6 ULA (fc00::/7) as private-ish
+    if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+      $b = $addr.GetAddressBytes()
+      return (($b[0] -band 0xFE) -eq 0xFC)
+    }
+    return $false
   } catch { return $false }
 }
 
-function Get-OSVersionString {
-  try {
-    $os = Get-CimInstance Win32_OperatingSystem
-    return "$($os.Caption) ($($os.Version))"
-  } catch {
-    return [System.Environment]::OSVersion.VersionString
-  }
+# --- Main ---
+if (-not (Test-Admin)) {
+  throw "Run this in an elevated PowerShell (Admin). netsh trace requires it."
 }
 
-function Get-ProcName([int]$pid) {
-  if ($pid -le 0) { return "?" }
-  try { return (Get-Process -Id $pid -ErrorAction Stop).ProcessName } catch { return "pid:$pid" }
-}
-
-function Ensure-Dir($p){ New-Item -ItemType Directory -Force -Path $p | Out-Null }
-
-function Try-NetshScenario([string]$scenarioName) {
-  # Quick probe: does netsh trace exist and list scenarios?
-  $out = & netsh trace show scenarios 2>&1
-  if ($LASTEXITCODE -ne 0) { return $false }
-  return ($out -match [regex]::Escape($scenarioName))
-}
-
-function Parse-NetshCsvOrFail($csvPath, [int]$Port, [string]$Protocol) {
-  $rows = Import-Csv $csvPath
-  if (-not $rows -or $rows.Count -eq 0) { throw "CSV is empty." }
-
-  # Schema sanity check (this is what usually becomes “finicky”)
-  $props = ($rows | Select-Object -First 1 | Get-Member -MemberType NoteProperty).Name
-  $need = @("Protocol","LocalPort","RemoteAddress","RemotePort","Direction")
-  foreach ($n in $need) {
-    if ($props -notcontains $n) {
-      throw "CSV schema mismatch: missing column '$n'. Present: $($props -join ', ')"
-    }
-  }
-
-  # Filter
-  $filtered = $rows
-  if ($Protocol -ne "ANY") {
-    $filtered = $filtered | Where-Object { $_.Protocol -eq $Protocol }
-  }
-  if ($Port -gt 0) {
-    $filtered = $filtered | Where-Object { $_.LocalPort -eq "$Port" }
-  }
-
-  # If still nothing, throw so we fall back automatically.
-  if (-not $filtered -or $filtered.Count -eq 0) {
-    throw "No matching rows after filtering (Protocol=$Protocol, LocalPort=$Port)."
-  }
-
-  # INBOUND: recv
-  $in = $filtered | Where-Object { $_.Direction -like "*recv*" }
-  # OUTBOUND: send
-  $out = $filtered | Where-Object { $_.Direction -like "*send*" }
-
-  return [pscustomobject]@{
-    Inbound  = $in
-    Outbound = $out
-  }
-}
-
-function Run-FallbackSampler([int]$DurationSeconds, [double]$IntervalSeconds, [int]$Top, [int]$Port, [string]$Protocol) {
-  Write-Warn "Using fallback sampler (TCP connection truth). This is stable, but it won't show pure UDP flows."
-
-  # Listener port set to infer IN vs OUT for TCP
-  $listenerPorts = @{}
-  if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-    Get-NetTCPConnection -State Listen | ForEach-Object { $listenerPorts[[int]$_.LocalPort] = $true }
-  } else {
-    (netstat -ano -p tcp | Select-String "LISTENING") | ForEach-Object {
-      $p = (($_ -replace '\s+',' ').Trim().Split(' '))[1].Split(':')[-1]
-      if ($p -match '^\d+$') { $listenerPorts[[int]$p] = $true }
-    }
-  }
-
-  $agg = @{}  # key -> object
-
-  function Touch([string]$dir, [int]$lport, [string]$rip, [int]$rport, [int]$pid, [string]$state) {
-    if ($Port -gt 0 -and $lport -ne $Port -and $rport -ne $Port) { return }
-    $key = "$dir|L:$lport|R:${rip}:$rport"
-    if (-not $agg.ContainsKey($key)) {
-      $agg[$key] = [pscustomobject]@{
-        Dir=$dir; LocalPort=$lport; RemoteIP=$rip; RemotePort=$rport;
-        Count=0; Pids = New-Object System.Collections.Generic.HashSet[int]
-        States = New-Object System.Collections.Generic.HashSet[string]
-      }
-    }
-    $o = $agg[$key]
-    $o.Count++
-    [void]$o.Pids.Add($pid)
-    if ($state) { [void]$o.States.Add($state) }
-  }
-
-  $steps = [int][Math]::Ceiling($DurationSeconds / $IntervalSeconds)
-  for ($i=0; $i -lt $steps; $i++) {
-    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-      Get-NetTCPConnection |
-        Where-Object { $_.RemoteAddress -and $_.RemotePort -and $_.State -ne "Listen" } |
-        ForEach-Object {
-          $lport = [int]$_.LocalPort
-          $rport = [int]$_.RemotePort
-          $rip   = [string]$_.RemoteAddress
-          $pid   = [int]$_.OwningProcess
-          $state = [string]$_.State
-          $dir   = $listenerPorts.ContainsKey($lport) ? "IN" : "OUT"
-          Touch $dir $lport $rip $rport $pid $state
-        }
-    } else {
-      (netstat -ano -p tcp | Select-String "^ *TCP") | ForEach-Object {
-        $parts = (($_ -replace '\s+',' ').Trim().Split(' '))
-        if ($parts.Count -lt 5) { return }
-        $local = $parts[1]; $remote = $parts[2]; $state = $parts[3]; $pid = [int]$parts[4]
-        $lport = [int]($local.Split(':')[-1])
-        $rport = [int]($remote.Split(':')[-1])
-        $rip   = ($remote -split ':')[0]
-        $dir   = if ($listenerPorts.ContainsKey($lport)) { "IN" } else { "OUT" }
-        Touch $dir $lport $rip $rport $pid $state
-      }
-    }
-    Start-Sleep -Seconds $IntervalSeconds
-  }
-
-  $rows = foreach ($k in $agg.Keys) {
-    $o = $agg[$k]
-    $pids = ($o.Pids | Sort-Object)
-    [pscustomobject]@{
-      Dir=$o.Dir; LocalPort=$o.LocalPort; RemoteIP=$o.RemoteIP; RemotePort=$o.RemotePort;
-      Count=$o.Count;
-      PIDs=($pids -join ";");
-      Processes=(($pids | ForEach-Object { Get-ProcName $_ } | Sort-Object -Unique) -join ";");
-      States=(($o.States | Sort-Object) -join ";")
-    }
-  } | Sort-Object Count -Descending
-
-  Write-Host ""
-  Write-Host "=== INBOUND (clients hitting your listening ports) ==="
-  $rows | Where-Object { $_.Dir -eq "IN" } | Select-Object -First $Top |
-    Format-Table -AutoSize Dir,LocalPort,RemoteIP,RemotePort,Count,Processes,States
-
-  Write-Host ""
-  Write-Host "=== OUTBOUND (dependencies: what this host calls) ==="
-  $rows | Where-Object { $_.Dir -eq "OUT" } | Select-Object -First $Top |
-    Format-Table -AutoSize Dir,LocalPort,RemoteIP,RemotePort,Count,Processes,States
-}
-
-# Main
 Ensure-Dir $OutDir
-$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-Write-Info "OS: $(Get-OSVersionString)"
-Write-Info "Duration: ${DurationSeconds}s (fallback sampler interval: ${IntervalSeconds}s)"
-if ($Port -gt 0) { Write-Info "Port focus: $Port" }
-Write-Info "Protocol filter (netsh parsing only): $Protocol"
-Write-Host ""
 
-$netshOk = $false
-$netshWhy = ""
-$etl = Join-Path $OutDir "scoreprobe-$stamp.etl"
-$csv = Join-Path $OutDir "scoreprobe-$stamp.csv"
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"
+if (-not $EtlPath) { $EtlPath = Join-Path $OutDir "scoring_$ts.etl" }
+if (-not $CsvPath) { $CsvPath = Join-Path $OutDir "scoring_$ts.csv" }
 
-# Try netsh first by default
-$haveNetsh = [bool](Get-Command netsh -ErrorAction SilentlyContinue)
-$haveTracerpt = [bool](Get-Command tracerpt -ErrorAction SilentlyContinue)
-$isAdmin = Test-IsAdmin
-
-if (-not $haveNetsh) {
-  $netshWhy = "netsh not found on PATH (weird box)."
-} elseif (-not $isAdmin) {
-  $netshWhy = "not running as Administrator (netsh trace requires elevation)."
-} elseif (-not (Try-NetshScenario "NetConnection")) {
-  $netshWhy = "netsh trace scenario 'NetConnection' not available on this OS / image."
-} elseif (-not $haveTracerpt) {
-  $netshWhy = "tracerpt not available (can't convert ETL -> CSV)."
+if (-not $NoCapture) {
+  Run-NetshTrace -EtlOut $EtlPath -Seconds $DurationSeconds
+  Convert-EtlToCsv -EtlIn $EtlPath -CsvOut $CsvPath
 } else {
-  Write-Info "Attempting netsh trace capture -> $etl"
-  $startOut = & netsh trace start capture=yes scenario=NetConnection tracefile="$etl" report=no persistent=no maxsize=100 filemode=circular 2>&1
-  $startCode = $LASTEXITCODE
-
-  if ($startCode -ne 0 -or ($startOut -match "(requires elevation|Access is denied|The command you entered is not valid|not found|already in progress)")) {
-    # Try to extract a human reason
-    if ($startOut -match "already in progress") {
-      $netshWhy = "netsh trace session already running. (Someone started it earlier.)"
-    } elseif ($startOut -match "requires elevation|Access is denied") {
-      $netshWhy = "netsh trace start denied (admin/elevation issue despite check)."
-    } elseif ($startOut -match "not valid|not found") {
-      $netshWhy = "netsh trace not supported / invalid command on this image."
-    } else {
-      $netshWhy = "netsh trace start failed (exit=$startCode): $($startOut | Select-Object -First 1)"
+  if (-not $CsvPath -and -not $EtlPath) {
+    throw "-NoCapture requires -CsvPath or -EtlPath."
+  }
+  if (-not (Test-Path -LiteralPath $CsvPath)) {
+    if (-not (Test-Path -LiteralPath $EtlPath)) {
+      throw "Could not find CSV ($CsvPath) or ETL ($EtlPath)."
     }
-  } else {
-    $netshOk = $true
-    Start-Sleep -Seconds $DurationSeconds
-    Write-Info "Stopping netsh trace"
-    & netsh trace stop 2>&1 | Out-Null
-
-    Write-Info "Converting ETL -> CSV via tracerpt -> $csv"
-    $trOut = & tracerpt "$etl" -o "$csv" -of CSV 2>&1
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $csv)) {
-      $netshOk = $false
-      $netshWhy = "tracerpt conversion failed: $($trOut | Select-Object -First 1)"
-    } else {
-      # Try parsing; if schema mismatch, treat as failure and fall back
-      try {
-        $parsed = Parse-NetshCsvOrFail $csv $Port $Protocol
-
-        Write-Host ""
-        Write-Host "=== NETSH PARSE: INBOUND (recv) top talkers ==="
-        ($parsed.Inbound | Group-Object RemoteAddress | Sort-Object Count -Descending | Select-Object -First $Top) |
-          ForEach-Object { "{0,6}  {1}" -f $_.Count, $_.Name }
-
-        Write-Host ""
-        Write-Host "=== NETSH PARSE: OUTBOUND (send) dependencies ==="
-        ($parsed.Outbound | Group-Object RemoteAddress,RemotePort | Sort-Object Count -Descending | Select-Object -First $Top) |
-          ForEach-Object { "{0,6}  {1}" -f $_.Count, $_.Name }
-
-        Write-Host ""
-        Write-Info "Artifacts:"
-        Write-Info "  ETL: $etl"
-        Write-Info "  CSV: $csv"
-        exit 0
-      } catch {
-        $netshOk = $false
-        $netshWhy = "netsh capture worked but CSV parsing is not reliable here: $($_.Exception.Message)"
-      }
-    }
+    Convert-EtlToCsv -EtlIn $EtlPath -CsvOut $CsvPath
   }
 }
 
-# If we got here: netsh path failed; explain and fall back
-Write-Warn "Netsh primary path FAILED: $netshWhy"
-Write-Warn "Falling back now."
-Run-FallbackSampler -DurationSeconds $DurationSeconds -IntervalSeconds $IntervalSeconds -Top $Top -Port $Port -Protocol $Protocol
+Write-Host "[*] Loading $CsvPath ..."
+$rows = Import-Csv -LiteralPath $CsvPath
+
+if (-not $rows -or $rows.Count -eq 0) {
+  throw "CSV has no rows. Capture might have been too short or tracerpt output isn’t the format expected."
+}
+
+# Basic schema sanity check (playbook relies on these column names) :contentReference[oaicite:8]{index=8}
+$need = @("LocalPort","RemotePort","RemoteAddress","Protocol","Direction")
+$missing = $need | Where-Object { -not ($rows[0].PSObject.Properties.Name -contains $_) }
+if ($missing.Count -gt 0) {
+  Write-Warning "CSV is missing expected columns: $($missing -join ', '). Output may be unreliable."
+}
+
+function Filter-Rows([object[]]$InputRows, [int]$Port) {
+  $f = $InputRows
+
+  if ($Port -gt 0) {
+    $f = $f | Where-Object { (Get-Prop $_ "LocalPort") -eq "$Port" }
+  }
+
+  if ($Protocol -ne "ANY") {
+    $f = $f | Where-Object { (Get-Prop $_ "Protocol") -eq $Protocol }
+  }
+
+  if ($Direction -ne "any") {
+    $f = $f | Where-Object { ((Get-Prop $_ "Direction") + "") -like "*$Direction*" }
+  }
+
+  return $f
+}
+
+# --- Output mode A: no ServicePort -> global top talkers ---
+if ($ServicePort -le 0) {
+  Write-Host ""
+  Write-Host "=== Global Top Talkers (RemoteAddress) ==="
+  $global = Filter-Rows -InputRows $rows -Port 0
+
+  $global |
+    Where-Object { (Get-Prop $_ "RemoteAddress") } |
+    Group-Object RemoteAddress |
+    Sort-Object Count -Descending |
+    Select-Object -First $Top |
+    ForEach-Object {
+      $ip = $_.Name
+      [pscustomobject]@{
+        Count        = $_.Count
+        RemoteAddress= $ip
+        PrivateIP    = (Is-PrivateIp $ip)
+      }
+    } | Format-Table -AutoSize
+
+  Write-Host ""
+  Write-Host "[*] Files:"
+  Write-Host "    ETL: $EtlPath"
+  Write-Host "    CSV: $CsvPath"
+  exit 0
+}
+
+# --- Output mode B: ServicePort specified -> scoring + dependencies ---
+Write-Host ""
+Write-Host "=== Service-Port View (LocalPort=$ServicePort, Protocol=$Protocol, Direction=$Direction) ==="
+
+$filtered = Filter-Rows -InputRows $rows -Port $ServicePort
+
+if (-not $filtered -or $filtered.Count -eq 0) {
+  Write-Warning "No rows matched LocalPort=$ServicePort. Wrong port, wrong protocol, or too short/noisy capture."
+} else {
+  if (-not $NoisyMode) {
+    $grouped = $filtered |
+      Where-Object { (Get-Prop $_ "RemoteAddress") } |
+      Group-Object RemoteAddress |
+      Sort-Object Count -Descending
+  } else {
+    # Playbook “noisy” option groups by RemoteAddress,RemotePort :contentReference[oaicite:9]{index=9}
+    $grouped = $filtered |
+      Where-Object { (Get-Prop $_ "RemoteAddress") -and (Get-Prop $_ "RemotePort") } |
+      Group-Object RemoteAddress,RemotePort |
+      Sort-Object Count -Descending
+  }
+
+  $topList = $grouped | Select-Object -First $Top
+  if ($topList.Count -eq 0) {
+    Write-Warning "No usable remote talkers found after grouping."
+  } else {
+    $scoringCandidate = $topList[0].Name.Split(",")[0].Trim()
+
+    Write-Host ""
+    Write-Host "Top talkers on the suspected scoring port (top one is your likely scoring IP):"
+    $topList | ForEach-Object {
+      $name = $_.Name
+      $ip = $name.Split(",")[0].Trim()
+      $rp = if ($name -like "*,*") { $name.Split(",")[1].Trim() } else { "" }
+      [pscustomobject]@{
+        Count         = $_.Count
+        RemoteAddress = $ip
+        RemotePort    = $rp
+        PrivateIP     = (Is-PrivateIp $ip)
+        LikelyScoring = ($ip -eq $scoringCandidate)
+      }
+    } | Format-Table -AutoSize
+
+    Write-Host ""
+    Write-Host "=== Dependency Candidates (other heavy RemoteAddress talkers, excluding the top scoring IP) ==="
+    # “Dependencies” view: everything else that talks to you a lot (all ports, both directions), excluding scoring IP.
+    $deps = $rows |
+      Where-Object { (Get-Prop $_ "RemoteAddress") -and ((Get-Prop $_ "RemoteAddress") -ne $scoringCandidate) } |
+      Group-Object RemoteAddress |
+      Sort-Object Count -Descending |
+      Select-Object -First $Top |
+      ForEach-Object {
+        $ip = $_.Name
+        [pscustomobject]@{
+          Count        = $_.Count
+          RemoteAddress= $ip
+          PrivateIP    = (Is-PrivateIp $ip)
+        }
+      }
+
+    $deps | Format-Table -AutoSize
+
+    Write-Host ""
+    Write-Host "[*] Likely scoring IP (best guess): $scoringCandidate"
+    Write-Host "[*] Reality check: if your service starts failing, rerun—scoring IP can change. :contentReference[oaicite:10]{index=10}"
+  }
+}
+
+Write-Host ""
+Write-Host "[*] Files:"
+Write-Host "    ETL: $EtlPath"
+Write-Host "    CSV: $CsvPath"
